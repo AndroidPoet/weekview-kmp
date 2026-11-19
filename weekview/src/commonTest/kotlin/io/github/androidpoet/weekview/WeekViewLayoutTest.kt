@@ -202,6 +202,59 @@ class WeekViewLayoutTest {
     }
 
     @Test
+    fun test_visibleAllDaySlots_moreLanesThanRows_keepsLastRowFree() {
+        val events = List(5) { event("e$it", at(monday, 0), at(monday, 0), isAllDay = true) } +
+            event("tuesday-only", at(tuesday, 0), at(tuesday, 0), isAllDay = true)
+
+        val layout = WeekViewLayout.of(events)
+
+        assertEquals(listOf(0, 1), layout.visibleAllDaySlots(monday, maxRows = 3).map { it.lane })
+        assertEquals(5, layout.visibleAllDaySlots(monday, maxRows = 5).size)
+        assertEquals(1, layout.visibleAllDaySlots(tuesday, maxRows = 3).size)
+    }
+
+    @Test
+    fun test_of_eventsOverlappingBySeconds_getSeparateColumns() {
+        val events =
+            listOf(
+                event("a", at(monday, 9), LocalDateTime(2026, 3, 2, 10, 0, 59)),
+                event("b", LocalDateTime(2026, 3, 2, 10, 0, 30), at(monday, 11)),
+            )
+
+        val layout = WeekViewLayout.of(events)
+
+        assertEquals(601, layout.slot(monday, "a").endMinute)
+        assertEquals(0.5f, layout.slot(monday, "a").width)
+        assertEquals(1, layout.slot(monday, "b").column)
+    }
+
+    @Test
+    fun test_of_eventsSpanningMillennia_laysOutOnlyTheDatesAsked() {
+        val events =
+            listOf(
+                event("timed", LocalDateTime(1, 1, 1, 0, 0), LocalDateTime(9999, 12, 31, 23, 0)),
+                event("all-day", LocalDateTime(1, 1, 1, 0, 0), LocalDateTime(9999, 12, 31, 0, 0), isAllDay = true),
+            )
+
+        val layout = WeekViewLayout.of(events)
+
+        assertEquals(0 to 1440, layout.slot(monday, "timed").let { it.startMinute to it.endMinute })
+        assertEquals(1, layout.allDayLaneCount(monday))
+        assertEquals(1380, layout.slot(LocalDate(9999, 12, 31), "timed").endMinute)
+        assertTrue(layout.allDaySlots(LocalDate(9999, 12, 30)).single().startsBeforeDay)
+    }
+
+    @Test
+    fun test_of_thousandsOfSimultaneousEvents_givesEachItsOwnColumn() {
+        val events = List(8000) { event("e$it", at(monday, 9), at(monday, 10)) }
+
+        val slots = WeekViewLayout.of(events).timedSlots(monday)
+
+        assertEquals(8000, slots.map { it.column }.distinct().size)
+        assertTrue(slots.all { it.width > 0f && it.left >= 0f && it.left + it.width <= 1f + 1e-4f })
+    }
+
+    @Test
     fun test_of_randomEvents_neverOverlapInsideADay() {
         val random = Random(seed = 42)
 

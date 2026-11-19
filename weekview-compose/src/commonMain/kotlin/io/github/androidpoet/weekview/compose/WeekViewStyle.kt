@@ -15,6 +15,9 @@ import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.TextUnit
 import io.github.androidpoet.weekview.EventTextMode
 import io.github.androidpoet.weekview.eventTextMode
+import io.github.androidpoet.weekview.localizedDayOfMonth
+import io.github.androidpoet.weekview.localizedHourLabel
+import io.github.androidpoet.weekview.localizedWeekdayLabel
 import io.github.androidpoet.weekview.prefersDarkText
 import io.github.androidpoet.weekview.verticalTextScale
 import androidx.compose.foundation.layout.Box
@@ -26,6 +29,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -33,14 +37,26 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.intl.Locale
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.androidpoet.weekview.WeekViewEvent
 import kotlinx.datetime.LocalDate
 
-/** Colors, text styles and sizes of a [WeekView]. Start from [WeekViewDefaults.style] and `copy`. */
+/**
+ * Colors, text styles and sizes of a [WeekView]. Start from [WeekViewDefaults.style] and `copy`.
+ *
+ * @param timeColumnWidth the least width of the hour column; it grows to fit the widest hour label.
+ * @param headerHeight the least height of the day headers; it grows with the font scale.
+ * @param allDayRowHeight the least height of an all-day row; it grows with the font scale.
+ * @param maxAllDayRows the most all-day rows shown. A date with more keeps the last row for a
+ * "+N" marker, so all-day events can never push the hour grid off the screen.
+ */
 @Immutable
 public data class WeekViewStyle(
     val backgroundColor: Color,
@@ -58,7 +74,19 @@ public data class WeekViewStyle(
     val allDayRowHeight: Dp = 24.dp,
     val eventGap: Dp = 2.dp,
     val eventCornerRadius: Dp = 6.dp,
-)
+    val maxAllDayRows: Int = 3,
+) {
+    init {
+        require(maxAllDayRows >= 1) { "maxAllDayRows must be at least 1" }
+    }
+}
+
+/** Diameter of the circle behind the day number: at least 28dp, more at large font scales. */
+internal fun WeekViewStyle.dayBadgeSize(density: Density): Dp = with(density) { maxOf(28.dp, headerTextStyle.fontSize.toDp() * 1.75f) }
+
+/** Height of the default day header: weekday line, a gap, the day badge. */
+internal fun WeekViewStyle.dayHeaderContentHeight(density: Density): Dp =
+    with(density) { timeTextStyle.fontSize.toDp() * 1.4f } + 2.dp + dayBadgeSize(density)
 
 public object WeekViewDefaults {
     /** The default style, following the system light/dark setting. */
@@ -108,7 +136,18 @@ public object WeekViewDefaults {
         eventTextStyle = TextStyle(fontSize = 12.sp, lineHeight = 15.sp),
     )
 
-    /** `09:00`. Pass your own lambda to [WeekView] for 12-hour or localized labels. */
+    /**
+     * Hour labels in the device's language and clock convention: `9 AM` or `09:00`. On Android
+     * the user's 24-hour setting wins over the locale.
+     */
+    @Composable
+    public fun rememberTimeLabel(): (hour: Int) -> String {
+        val use24HourClock = deviceUses24HourClock()
+        // Keyed by locale as well: a language change must produce new labels.
+        return remember(use24HourClock, Locale.current) { { hour -> localizedHourLabel(hour, use24HourClock) } }
+    }
+
+    /** Always `09:00`, whatever the locale. */
     public fun timeLabel(hour: Int): String = "${hour.toString().padStart(2, '0')}:00"
 
     /** Weekday over day-of-month; today's number sits in an accent circle. */
@@ -120,20 +159,22 @@ public object WeekViewDefaults {
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             BasicText(
-                text = date.dayOfWeek.name.take(3),
+                text = remember(date, Locale.current) { localizedWeekdayLabel(date) },
                 style = style.timeTextStyle.copy(color = if (isToday) style.accentColor else style.timeTextStyle.color),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
             Box(
                 modifier =
                     Modifier
                         .padding(top = 2.dp)
-                        .size(28.dp)
+                        .size(style.dayBadgeSize(LocalDensity.current))
                         .clip(CircleShape)
                         .background(if (isToday) style.accentColor else Color.Transparent),
                 contentAlignment = Alignment.Center,
             ) {
                 BasicText(
-                    text = date.day.toString(),
+                    text = remember(date, Locale.current) { localizedDayOfMonth(date) },
                     style = style.headerTextStyle.copy(color = if (isToday) readableOn(style.accentColor) else style.headerTextStyle.color),
                 )
             }
@@ -153,7 +194,8 @@ public object WeekViewDefaults {
     ) {
         val measurer = rememberTextMeasurer()
         val background = Color(event.color)
-        val textStyle = style.eventTextStyle.copy(color = readableOn(background))
+        // Content direction: a title aligns by its own script, not by the layout around it.
+        val textStyle = style.eventTextStyle.copy(color = readableOn(background), textDirection = TextDirection.Content)
         val titleStyle = textStyle.copy(fontWeight = FontWeight.SemiBold)
         Spacer(
             Modifier

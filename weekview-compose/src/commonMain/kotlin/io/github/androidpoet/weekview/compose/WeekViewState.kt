@@ -11,6 +11,7 @@ import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import io.github.androidpoet.weekview.WeekViewLayout
@@ -85,22 +86,27 @@ public class WeekViewState(
         return (old - new) * pxPerMinute
     }
 
+    /** Pixels per minute as drawn: an hour is never shorter than 1/24 of the viewport, so the grid always fills it. */
+    internal fun pxPerMinute(density: Density): Float = maxOf(with(density) { hourHeight.toPx() }, bodyHeightPx / HOURS_PER_DAY) / 60f
+
     /** Scales the hour height by [factor], keeping the minute under [focusY] (pixels from the grid top) in place. */
     internal fun zoomBy(
         factor: Float,
         focusY: Float,
-        pxPerMinute: Float,
+        density: Density,
     ) {
-        val old = hourHeight
-        val new = (old * factor).coerceIn(minHourHeight, maxHourHeight)
-        if (new == old) return
-        val focusMinute = scrollPx(pxPerMinute) / pxPerMinute + focusY / pxPerMinute
+        val new = (hourHeight * factor).coerceIn(minHourHeight, maxHourHeight)
+        if (new == hourHeight) return
+        val oldScale = pxPerMinute(density)
+        val focusMinute = (scrollPx(oldScale) + focusY) / oldScale
         hourHeight = new
-        topMinute = focusMinute - focusY / (pxPerMinute * (new / old))
+        // The drawn scale, not the requested one: the viewport-filling floor may still be in charge.
+        topMinute = focusMinute - focusY / pxPerMinute(density)
     }
 
     internal companion object {
         const val ANCHOR_INDEX = Int.MAX_VALUE / 2
+        const val HOURS_PER_DAY = 24f
 
         fun saver(
             minHourHeight: Dp,

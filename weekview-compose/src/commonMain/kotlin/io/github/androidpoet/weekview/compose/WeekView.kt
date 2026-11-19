@@ -9,7 +9,6 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.rememberScrollableState
 import androidx.compose.foundation.gestures.scrollable
 import androidx.compose.foundation.gestures.snapping.SnapPosition
 import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
@@ -48,6 +47,12 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
+import androidx.compose.foundation.gestures.ScrollableState
+import androidx.compose.runtime.key
+import androidx.compose.runtime.snapshots.SnapshotStateList
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import io.github.androidpoet.weekview.TimedSlot
 import io.github.androidpoet.weekview.WeekViewEvent
@@ -68,7 +73,8 @@ import kotlin.math.roundToInt
  *
  * @param visibleDays how many day columns fit the width: 1 for a day view, 7 for a week.
  * @param now where the "now" line is drawn and which date is highlighted; `null` hides both.
- * @param timeLabel text of the hour labels in the left column.
+ * @param timeLabel text of the hour labels (0..23) in the left column, which grows to fit the
+ * widest one. By default the device's language and clock convention decide: `9 AM` or `09:00`.
  * @param dayHeader content of a column header.
  * @param eventContent content of one event block; it is given the exact size of the event's slot.
  */
@@ -84,39 +90,54 @@ public fun WeekView(
     onEventLongClick: (WeekViewEvent) -> Unit = {},
     onEmptyClick: (LocalDateTime) -> Unit = {},
     onEmptyLongClick: (LocalDateTime) -> Unit = {},
-    timeLabel: (hour: Int) -> String = WeekViewDefaults::timeLabel,
+    timeLabel: (hour: Int) -> String = WeekViewDefaults.rememberTimeLabel(),
     dayHeader: @Composable (date: LocalDate, isToday: Boolean) -> Unit = { date, isToday ->
         WeekViewDefaults.DayHeader(date, isToday, style)
     },
     eventContent: @Composable (event: WeekViewEvent) -> Unit = { WeekViewDefaults.EventContent(it, style) },
 ) {
     require(visibleDays >= 1) { "visibleDays must be at least 1" }
-    val layout = remember(events) { WeekViewLayout.of(events) }
+    // A SnapshotStateList stays the same object while its content changes; lay out what it holds now.
+    val currentEvents = if (events is SnapshotStateList) events.toList() else events
+    val layout = remember(currentEvents) { WeekViewLayout.of(currentEvents) }
     val density = LocalDensity.current
-    // An hour is never shorter than 1/24 of the viewport, so the grid always fills it.
-    val pxPerMinute =
-        remember(state, density) {
-            { maxOf(with(density) { state.hourHeight.toPx() }, state.bodyHeightPx / HOURS_PER_DAY.toFloat()) / 60f }
-        }
+    val pxPerMinute = remember(state, density) { { state.pxPerMinute(density) } }
+    val textMeasurer = rememberTextMeasurer()
 
-    val allDayLanes by remember(layout, state) {
+    // Header and all-day rows grow with the fonts, so a large font scale cannot clip them.
+    val headerHeight = maxOf(style.headerHeight, style.dayHeaderContentHeight(density) + 8.dp)
+    val allDayRowHeight =
+        remember(style, density) {
+            val lineHeight = textMeasurer.measure("Ag", style.eventTextStyle.copy(fontWeight = FontWeight.SemiBold)).size.height
+            maxOf(style.allDayRowHeight, with(density) { lineHeight.toDp() } + style.eventGap + 2.dp)
+        }
+    val maxAllDayRows = style.maxAllDayRows
+    val allDayLanes by remember(layout, state, maxAllDayRows) {
         derivedStateOf {
-            state.listState.layoutInfo.visibleItemsInfo
-                .maxOfOrNull { layout.allDayLaneCount(state.dateAt(it.index)) } ?: 0
+            val lanes = state.listState.layoutInfo.visibleItemsInfo.maxOfOrNull { layout.allDayLaneCount(state.dateAt(it.index)) } ?: 0
+            lanes.coerceAtMost(maxAllDayRows)
         }
     }
-    val allDayHeight by animateDpAsState(style.allDayRowHeight * allDayLanes)
-    val headerHeightPx by rememberUpdatedState(with(density) { (style.headerHeight + allDayHeight).toPx() })
-    val verticalScroll = rememberScrollableState { delta -> state.dispatchScroll(delta, pxPerMinute()) }
+    val allDayHeight by animateDpAsState(allDayRowHeight * allDayLanes)
+    val headerHeightPx by rememberUpdatedState(with(density) { (headerHeight + allDayHeight).toPx() })
+    val verticalScroll = remember(state, pxPerMinute) { ScrollableState { delta -> state.dispatchScroll(delta, pxPerMinute()) } }
+    val onZoom by rememberUpdatedState { zoom: Float, centroidY: Float -> state.zoomBy(zoom, centroidY - headerHeightPx, density) }
+
+    val hourLabels = remember(timeLabel) { List(HOURS_PER_DAY) { timeLabel(it) } }
+    val timeColumnWidth =
+        remember(hourLabels, style, density) {
+            val widest = hourLabels.maxOf { textMeasurer.measure(it, style.timeTextStyle, softWrap = false, maxLines = 1).size.width }
+            maxOf(style.timeColumnWidth, with(density) { widest.toDp() } + LABEL_END_PADDING * 2)
+        }
 
     Row(modifier.background(style.backgroundColor).clipToBounds()) {
-        Column(Modifier.width(style.timeColumnWidth).fillMaxHeight()) {
-            Spacer(Modifier.fillMaxWidth().height(style.headerHeight + allDayHeight).background(style.headerColor))
+        Column(Modifier.width(timeColumnWidth).fillMaxHeight()) {
+            Spacer(Modifier.fillMaxWidth().height(headerHeight + allDayHeight).background(style.headerColor))
             HourLabels(
                 state = state,
                 style = style,
                 pxPerMinute = pxPerMinute,
-                timeLabel = timeLabel,
+                hourLabels = hourLabels,
                 modifier = Modifier.weight(1f).fillMaxWidth().onSizeChanged { state.bodyHeightPx = it.height },
             )
         }
@@ -128,30 +149,43 @@ public fun WeekView(
                     .weight(1f)
                     .fillMaxHeight()
                     .scrollable(verticalScroll, Orientation.Vertical)
-                    .pinchToZoom { zoom, centroidY -> state.zoomBy(zoom, centroidY - headerHeightPx, pxPerMinute()) },
+                    .pinchToZoom { zoom, centroidY -> onZoom(zoom, centroidY) },
         ) {
             items(count = Int.MAX_VALUE, key = { it }) { index ->
-                val date = remember(index) { state.dateAt(index) }
+                val date = remember(state, index) { state.dateAt(index) }
                 val isToday = date == now?.date
                 Column(Modifier.fillParentMaxWidth(1f / visibleDays).fillParentMaxHeight()) {
-                    Box(Modifier.fillMaxWidth().height(style.headerHeight).background(style.headerColor), Alignment.Center) {
+                    Box(Modifier.fillMaxWidth().height(headerHeight).background(style.headerColor), Alignment.Center) {
                         dayHeader(date, isToday)
                     }
                     Box(Modifier.fillMaxWidth().height(allDayHeight).background(style.headerColor).clipToBounds()) {
-                        layout.allDaySlots(date).forEach { slot ->
-                            EventBox(
-                                event = slot.event,
-                                shape = eventShape(style.eventCornerRadius, slot.startsBeforeDay, slot.endsAfterDay, horizontal = true),
-                                onClick = onEventClick,
-                                onLongClick = onEventLongClick,
-                                content = eventContent,
-                                modifier =
-                                    Modifier
-                                        .offset(y = style.allDayRowHeight * slot.lane)
-                                        .fillMaxWidth()
-                                        .height(style.allDayRowHeight)
-                                        .padding(horizontal = style.eventGap / 2, vertical = style.eventGap / 2),
-                            )
+                        val allDaySlots = layout.visibleAllDaySlots(date, maxAllDayRows)
+                        allDaySlots.forEach { slot ->
+                            key(slot.event.id) {
+                                EventBox(
+                                    event = slot.event,
+                                    shape = eventShape(style.eventCornerRadius, slot.startsBeforeDay, slot.endsAfterDay, horizontal = true),
+                                    onClick = onEventClick,
+                                    onLongClick = onEventLongClick,
+                                    content = eventContent,
+                                    modifier =
+                                        Modifier
+                                            .offset(y = allDayRowHeight * slot.lane)
+                                            .fillMaxWidth()
+                                            .height(allDayRowHeight)
+                                            .padding(horizontal = style.eventGap / 2, vertical = style.eventGap / 2),
+                                )
+                            }
+                        }
+                        // The events that did not fit under maxAllDayRows.
+                        val hidden = layout.allDaySlots(date).size - allDaySlots.size
+                        if (hidden > 0) {
+                            Box(
+                                Modifier.offset(y = allDayRowHeight * (maxAllDayRows - 1)).fillMaxWidth().height(allDayRowHeight),
+                                Alignment.Center,
+                            ) {
+                                BasicText("+$hidden", style = style.timeTextStyle, maxLines = 1)
+                            }
                         }
                     }
                     DayBody(
@@ -192,11 +226,11 @@ private fun HourLabels(
     state: WeekViewState,
     style: WeekViewStyle,
     pxPerMinute: () -> Float,
-    timeLabel: (Int) -> String,
+    hourLabels: List<String>,
     modifier: Modifier = Modifier,
 ) {
     Layout(
-        content = { for (hour in 1 until HOURS_PER_DAY) BasicText(timeLabel(hour), style = style.timeTextStyle) },
+        content = { for (hour in 1 until HOURS_PER_DAY) BasicText(hourLabels[hour], style = style.timeTextStyle, maxLines = 1, softWrap = false) },
         modifier = modifier.clipToBounds(),
     ) { measurables, constraints ->
         val placeables = measurables.map { it.measure(constraints.copy(minWidth = 0, minHeight = 0)) }
@@ -206,7 +240,8 @@ private fun HourLabels(
             val scroll = state.scrollPx(scale)
             placeables.forEachIndexed { index, placeable ->
                 val lineY = (index + 1) * 60 * scale - scroll
-                placeable.place(constraints.maxWidth - placeable.width - endPadding, (lineY - placeable.height / 2f).roundToInt())
+                // Relative, so the labels hug the grid in right-to-left layouts too.
+                placeable.placeRelative(constraints.maxWidth - placeable.width - endPadding, (lineY - placeable.height / 2f).roundToInt())
             }
         }
     }
@@ -239,13 +274,16 @@ private fun DayBody(
     Layout(
         content = {
             slots.forEach { slot ->
-                EventBox(
-                    event = slot.event,
-                    shape = eventShape(style.eventCornerRadius, slot.startsBeforeDay, slot.endsAfterDay, horizontal = false),
-                    onClick = onEventClick,
-                    onLongClick = onEventLongClick,
-                    content = eventContent,
-                )
+                // Keyed, so state remembered inside eventContent stays with its event.
+                key(slot.event.id) {
+                    EventBox(
+                        event = slot.event,
+                        shape = eventShape(style.eventCornerRadius, slot.startsBeforeDay, slot.endsAfterDay, horizontal = false),
+                        onClick = onEventClick,
+                        onLongClick = onEventLongClick,
+                        content = eventContent,
+                    )
+                }
             }
         },
         modifier =
@@ -260,14 +298,16 @@ private fun DayBody(
                         val y = hour * 60 * scale - scroll
                         if (y in 0f..size.height) drawLine(style.hourLineColor, Offset(0f, y), Offset(size.width, y), hairline)
                     }
-                    drawLine(style.dividerColor, Offset(0f, 0f), Offset(0f, size.height), hairline)
+                    // The edge a day starts from: where its divider and the "now" dot sit.
+                    val startX = if (layoutDirection == LayoutDirection.Rtl) size.width else 0f
+                    drawLine(style.dividerColor, Offset(startX, 0f), Offset(startX, size.height), hairline)
                     drawContent()
                     if (nowMinute != null) {
                         val y = nowMinute * scale - scroll
                         drawLine(style.nowColor, Offset(0f, y), Offset(size.width, y), 2.dp.toPx())
-                        drawCircle(style.nowColor, 4.dp.toPx(), Offset(0f, y))
+                        drawCircle(style.nowColor, 4.dp.toPx(), Offset(startX, y))
                     }
-                }.pointerInput(date) {
+                }.pointerInput(date, state, pxPerMinute) {
                     detectTapGestures(
                         onTap = { currentOnEmptyClick(dateTimeAt(it.y)) },
                         onLongPress = { currentOnEmptyLongClick(dateTimeAt(it.y)) },

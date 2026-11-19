@@ -15,6 +15,7 @@ import android.text.Spanned
 import android.text.StaticLayout
 import android.text.TextPaint
 import android.text.TextUtils
+import android.text.format.DateFormat
 import android.text.style.StyleSpan
 import android.util.AttributeSet
 import android.util.TypedValue
@@ -85,11 +86,36 @@ public class WeekView
         public var onEmptyLongClick: ((LocalDateTime) -> Unit)? = null
         public var onFirstVisibleDateChanged: ((LocalDate) -> Unit)? = null
 
-        /** Small first line of a column header; the day of the month is drawn under it. */
-        public var weekdayLabel: (LocalDate) -> String by redrawing { it.dayOfWeek.name.take(3) }
+        /**
+         * The current time: where the "now" line is drawn, which date is highlighted and where
+         * [goToToday] goes. Defaults to the device's clock and time zone; supply your own when the
+         * events are in another zone, or return `null` to hide the line and the highlight.
+         */
+        public var currentTime: () -> LocalDateTime? by redrawing(::currentLocalDateTime)
 
-        /** Text of an hour label in the left column. */
-        public var timeLabel: (hour: Int) -> String by redrawing { "${it.toString().padStart(2, '0')}:00" }
+        /**
+         * The most all-day rows shown. A date with more keeps the last row for a "+N" marker, so
+         * all-day events can never push the hour grid off the view.
+         */
+        public var maxAllDayRows: Int = 3
+            set(value) {
+                require(value >= 1) { "maxAllDayRows must be at least 1" }
+                field = value
+                invalidate()
+            }
+
+        /** Small first line of a column header; the day of the month is drawn under it. */
+        public var weekdayLabel: (LocalDate) -> String by redrawing(::localizedWeekdayLabel)
+
+        /**
+         * Text of an hour label (0..23) in the left column, which grows to fit the widest one.
+         * By default the device's language and its 12/24-hour setting decide: `9 AM` or `09:00`.
+         */
+        public var timeLabel: (hour: Int) -> String = { localizedHourLabel(it, DateFormat.is24HourFormat(context)) }
+            set(value) {
+                field = value
+                refreshHourLabels()
+            }
 
         private val isNight = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
         public var gridBackgroundColor: Int by redrawing(if (isNight) 0xFF0B1220.toInt() else Color.WHITE)
@@ -101,8 +127,8 @@ public class WeekView
         public var headerTextColor: Int by redrawing(if (isNight) 0xFFE2E8F0.toInt() else 0xFF0F172A.toInt())
         public var timeTextColor: Int by redrawing(if (isNight) 0xFF94A3B8.toInt() else 0xFF64748B.toInt())
 
-        /** The date in the first visible column. */
-        public val firstVisibleDate: LocalDate get() = dateAt(scrollDays.roundToInt())
+        /** The date in the first column that is at least partly visible. */
+        public val firstVisibleDate: LocalDate get() = dateAt(floor(scrollDays + SNAP_EPSILON).toInt())
 
         private var eventLayout = WeekViewLayout.Empty
         private var anchorDate = currentLocalDateTime().date
@@ -115,9 +141,8 @@ public class WeekView
         private var visibleAllDayLanes = 0
         private var lastNotifiedDate: LocalDate? = null
 
-        private val timeColumnWidth = dp(52f)
-        private val headerHeight = dp(56f)
-        private val allDayRowHeight = dp(24f)
+        private var hourLabels: List<String> = emptyList()
+        private var timeColumnWidth = dp(MIN_TIME_COLUMN_DP)
         private val eventGap = dp(2f)
         private val eventRadius = dp(6f)
         private val eventPaddingX = dp(5f)
@@ -129,7 +154,13 @@ public class WeekView
         private val headerTextPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { textSize = sp(16f) }
         private val timeTextPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { textSize = sp(11f) }
         private val eventTextSize = sp(12f)
-        private val eventTextPaint = TextPaint(Paint.ANTI_ALIAS_FLAG)
+        private val eventTextPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { textSize = eventTextSize }
+
+        // Header and all-day rows are sized from the fonts, so a large font scale cannot clip them.
+        private val dayBadgeRadius = maxOf(dp(14f), headerTextPaint.fontSpacing * 0.6f)
+        private val headerContentHeight = timeTextPaint.fontSpacing + dp(2f) + dayBadgeRadius * 2
+        private val headerHeight = maxOf(dp(56f), headerContentHeight + dp(8f))
+        private val allDayRowHeight = maxOf(dp(24f), eventTextPaint.fontSpacing + eventGap + dp(2f))
         private val eventTitlePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.DEFAULT_BOLD }
         private val rect = RectF()
 
@@ -147,7 +178,13 @@ public class WeekView
 
         /** Rebuilt on every draw: the visible part of each drawn event, topmost last. */
         private val hitTargets = ArrayList<HitTarget>()
-        private val textLayouts = HashMap<TextKey, StaticLayout>()
+
+        /** Least recently used layouts go first, one at a time. */
+        private val textLayouts =
+            object : LinkedHashMap<TextKey, StaticLayout>(64, 0.75f, true) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<TextKey, StaticLayout>?): Boolean = size > MAX_CACHED_TEXT_LAYOUTS
+            }
+        private val longestWordWidths = HashMap<String, Float>()
 
         private enum class Direction { NONE, HORIZONTAL, VERTICAL }
 
@@ -160,6 +197,11 @@ public class WeekView
 
         private val dayWidth: Float get() = (width - timeColumnWidth) / visibleDays
         private val bodyTop: Float get() = headerHeight + visibleAllDayLanes * allDayRowHeight
+        private val isRtl: Boolean get() = layoutDirection == LAYOUT_DIRECTION_RTL
+
+        /** The grid (everything but the time column) spans these x; the time column takes the rest. */
+        private val gridLeft: Float get() = if (isRtl) 0f else timeColumnWidth
+        private val gridRight: Float get() = if (isRtl) width - timeColumnWidth else width.toFloat()
         private val bodyHeight: Float get() = (height - bodyTop).coerceAtLeast(1f)
         private val pxPerMinute: Float get() = maxOf(hourHeight, bodyHeight / HOURS_PER_DAY) / 60f
 
@@ -178,6 +220,42 @@ public class WeekView
                 hourHeight = array.getDimension(R.styleable.WeekView_hourHeight, hourHeight)
                 array.recycle()
             }
+            refreshHourLabels()
+        }
+
+        /** Re-reads the hour labels and fits the time column to the widest one. */
+        private fun refreshHourLabels() {
+            hourLabels = List(HOURS_PER_DAY) { timeLabel(it) }
+            timeColumnWidth = maxOf(dp(MIN_TIME_COLUMN_DP), hourLabels.maxOf { timeTextPaint.measureText(it) } + 2 * dp(TIME_LABEL_PADDING_DP))
+            settleScroll()
+            invalidate()
+        }
+
+        override fun onSizeChanged(
+            w: Int,
+            h: Int,
+            oldw: Int,
+            oldh: Int,
+        ) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            settleScroll()
+        }
+
+        override fun onRtlPropertiesChanged(layoutDirection: Int) {
+            super.onRtlPropertiesChanged(layoutDirection)
+            invalidate()
+        }
+
+        /**
+         * The scrollers count pixels, which mean other days once the column width changes; land
+         * a running animation on the day it was heading for.
+         */
+        private fun settleScroll() {
+            if (xScroller.isFinished && snapTarget == null) return
+            val target = snapTarget ?: scrollDays.roundToInt()
+            stopScrolling()
+            scrollDays = target.toFloat()
+            notifyDateChanged()
         }
 
         /** Scrolls so [date] is the first visible column. */
@@ -196,7 +274,7 @@ public class WeekView
             }
         }
 
-        public fun goToToday(animate: Boolean = true): Unit = goToDate(currentLocalDateTime().date, animate)
+        public fun goToToday(animate: Boolean = true): Unit = goToDate((currentTime() ?: currentLocalDateTime()).date, animate)
 
         /** Scrolls so [hour] (e.g. `8.5f` for 08:30) is at the top of the grid. */
         public fun goToHour(hour: Float) {
@@ -217,46 +295,58 @@ public class WeekView
             super.onDetachedFromWindow()
         }
 
+        override fun onWindowVisibilityChanged(visibility: Int) {
+            super.onWindowVisibilityChanged(visibility)
+            // The language or the 24-hour setting may have changed while the view was away.
+            if (visibility == VISIBLE) refreshHourLabels()
+        }
+
         // region Drawing
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             hitTargets.clear()
-            if (textLayouts.size > MAX_CACHED_TEXT_LAYOUTS) textLayouts.clear()
+            if (longestWordWidths.size > MAX_CACHED_TEXT_LAYOUTS) longestWordWidths.clear()
 
             val firstDay = floor(scrollDays).toInt()
             // One extra column covers the day sliding in while dragging.
-            val days = (firstDay..firstDay + visibleDays).filter { dayLeft(it) < width - 0.5f }
-            visibleAllDayLanes = days.maxOfOrNull { eventLayout.allDayLaneCount(dateAt(it)) } ?: 0
+            val days = (firstDay..firstDay + visibleDays).filter { (it - scrollDays) * dayWidth < gridRight - gridLeft - 0.5f }
+            visibleAllDayLanes = (days.maxOfOrNull { eventLayout.allDayLaneCount(dateAt(it)) } ?: 0).coerceAtMost(maxAllDayRows)
             topMinute = topMinute.coerceIn(0f, maxTopMinute())
-            val now = currentLocalDateTime()
+            val now = currentTime()
 
             // Not drawColor: a host that does not clip its children (Compose's AndroidView) would
             // let that flood everything around the view.
             fillPaint.color = gridBackgroundColor
             canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), fillPaint)
             drawBody(canvas, days, now)
-            drawHeader(canvas, days, now.date)
+            drawHeader(canvas, days, now?.date)
             drawTimeColumn(canvas)
         }
 
-        private fun dayLeft(dayIndex: Int): Float = timeColumnWidth + (dayIndex - scrollDays) * dayWidth
+        /** Left edge of a day column on screen; days run right to left in an RTL layout. */
+        private fun dayLeft(dayIndex: Int): Float {
+            val offset = (dayIndex - scrollDays) * dayWidth
+            return if (isRtl) gridRight - offset - dayWidth else gridLeft + offset
+        }
 
         private fun minuteY(minute: Float): Float = bodyTop + (minute - topMinute) * pxPerMinute
 
         private fun drawBody(
             canvas: Canvas,
             days: List<Int>,
-            now: LocalDateTime,
+            now: LocalDateTime?,
         ) {
-            val bodyBounds = RectF(timeColumnWidth, bodyTop, width.toFloat(), height.toFloat())
+            val bodyBounds = RectF(gridLeft, bodyTop, gridRight, height.toFloat())
             canvas.save()
             canvas.clipRect(bodyBounds)
             for (day in days) {
                 val date = dateAt(day)
                 val left = dayLeft(day)
                 val right = left + dayWidth
-                if (date == now.date) {
+                // The edge a day starts from: where its divider and the "now" dot sit.
+                val startEdge = if (isRtl) right else left
+                if (date == now?.date) {
                     fillPaint.color = todayColor
                     canvas.drawRect(left, bodyTop, right, height.toFloat(), fillPaint)
                 }
@@ -265,7 +355,7 @@ public class WeekView
                     val y = minuteY(hour * 60f)
                     if (y >= bodyTop && y <= height) canvas.drawLine(left, y, right, y, linePaint)
                 }
-                canvas.drawLine(left, bodyTop, left, height.toFloat(), linePaint)
+                canvas.drawLine(startEdge, bodyTop, startEdge, height.toFloat(), linePaint)
 
                 for (slot in eventLayout.timedSlots(date)) {
                     rect.set(
@@ -278,11 +368,11 @@ public class WeekView
                     drawEvent(canvas, slot.event, bodyBounds)
                 }
 
-                if (date == now.date) {
+                if (now != null && date == now.date) {
                     val y = minuteY(now.hour * 60f + now.minute)
                     nowPaint.color = nowColor
                     canvas.drawLine(left, y, right, y, nowPaint)
-                    canvas.drawCircle(left, y, dp(4f), nowPaint)
+                    canvas.drawCircle(startEdge, y, dp(4f), nowPaint)
                 }
             }
             canvas.restore()
@@ -291,9 +381,10 @@ public class WeekView
         private fun drawHeader(
             canvas: Canvas,
             days: List<Int>,
-            today: LocalDate,
+            today: LocalDate?,
         ) {
-            val headerBounds = RectF(timeColumnWidth, 0f, width.toFloat(), bodyTop)
+            val headerBounds = RectF(gridLeft, 0f, gridRight, bodyTop)
+            val contentTop = (headerHeight - headerContentHeight) / 2
             canvas.save()
             canvas.clipRect(headerBounds)
             fillPaint.color = headerColor
@@ -306,22 +397,29 @@ public class WeekView
                 timeTextPaint.color = if (isToday) accentColor else timeTextColor
                 timeTextPaint.textAlign = Paint.Align.CENTER
                 val weekday = TextUtils.ellipsize(weekdayLabel(date), timeTextPaint, dayWidth - eventGap * 2, TextUtils.TruncateAt.END)
-                canvas.drawText(weekday, 0, weekday.length, centerX, dp(18f), timeTextPaint)
+                canvas.drawText(weekday, 0, weekday.length, centerX, contentTop - timeTextPaint.ascent(), timeTextPaint)
 
-                val numberCenterY = dp(36f)
+                val numberCenterY = contentTop + headerContentHeight - dayBadgeRadius
                 if (isToday) {
                     fillPaint.color = accentColor
-                    canvas.drawCircle(centerX, numberCenterY, dp(14f), fillPaint)
+                    canvas.drawCircle(centerX, numberCenterY, dayBadgeRadius, fillPaint)
                 }
                 headerTextPaint.color = if (!isToday) headerTextColor else if (prefersDarkText(accentColor)) DARK_TEXT else Color.WHITE
                 headerTextPaint.textAlign = Paint.Align.CENTER
                 val baseline = numberCenterY - (headerTextPaint.ascent() + headerTextPaint.descent()) / 2
-                canvas.drawText(date.day.toString(), centerX, baseline, headerTextPaint)
+                canvas.drawText(localizedDayOfMonth(date), centerX, baseline, headerTextPaint)
 
-                for (slot in eventLayout.allDaySlots(date)) {
+                val allDaySlots = eventLayout.visibleAllDaySlots(date, maxAllDayRows)
+                for (slot in allDaySlots) {
                     val top = headerHeight + slot.lane * allDayRowHeight
                     rect.set(left + eventGap / 2, top + eventGap / 2, left + dayWidth - eventGap / 2, top + allDayRowHeight - eventGap / 2)
                     drawEvent(canvas, slot.event, headerBounds)
+                }
+                val hidden = eventLayout.allDaySlots(date).size - allDaySlots.size
+                if (hidden > 0) {
+                    val rowCenterY = headerHeight + (maxAllDayRows - 0.5f) * allDayRowHeight
+                    timeTextPaint.color = timeTextColor
+                    canvas.drawText("+$hidden", centerX, rowCenterY - (timeTextPaint.ascent() + timeTextPaint.descent()) / 2, timeTextPaint)
                 }
             }
             canvas.restore()
@@ -330,19 +428,24 @@ public class WeekView
         }
 
         private fun drawTimeColumn(canvas: Canvas) {
+            // The column sits before the grid: on the left, or on the right in an RTL layout.
+            val left = if (isRtl) gridRight else 0f
+            val right = left + timeColumnWidth
             canvas.save()
-            canvas.clipRect(0f, bodyTop, timeColumnWidth, height.toFloat())
+            canvas.clipRect(left, bodyTop, right, height.toFloat())
             fillPaint.color = gridBackgroundColor
-            canvas.drawRect(0f, bodyTop, timeColumnWidth, height.toFloat(), fillPaint)
+            canvas.drawRect(left, bodyTop, right, height.toFloat(), fillPaint)
             timeTextPaint.color = timeTextColor
-            timeTextPaint.textAlign = Paint.Align.RIGHT
+            // Labels hug the grid.
+            timeTextPaint.textAlign = if (isRtl) Paint.Align.LEFT else Paint.Align.RIGHT
+            val labelX = if (isRtl) left + dp(TIME_LABEL_PADDING_DP) else right - dp(TIME_LABEL_PADDING_DP)
             val centerOffset = (timeTextPaint.ascent() + timeTextPaint.descent()) / 2
             for (hour in 1 until HOURS_PER_DAY) {
-                canvas.drawText(timeLabel(hour), timeColumnWidth - dp(8f), minuteY(hour * 60f) - centerOffset, timeTextPaint)
+                canvas.drawText(hourLabels[hour], labelX, minuteY(hour * 60f) - centerOffset, timeTextPaint)
             }
             canvas.restore()
             fillPaint.color = headerColor
-            canvas.drawRect(0f, 0f, timeColumnWidth, bodyTop, fillPaint)
+            canvas.drawRect(left, 0f, right, bodyTop, fillPaint)
         }
 
         /** Draws [event] into [rect] and records the part of it inside [clip] as tappable. */
@@ -380,7 +483,7 @@ public class WeekView
             val textTop = maxOf(rect.top, clipTop)
             val textHeight = rect.bottom - textTop
             val textWidth = rect.width() - eventPaddingX * 2
-            val longestWord = event.title.split(' ').maxOf { eventTitlePaint.measureText(it) }
+            val longestWord = longestWordWidths.getOrPut(event.title) { event.title.split(' ').maxOf { eventTitlePaint.measureText(it) } }
 
             canvas.save()
             canvas.clipRect(rect)
@@ -459,7 +562,7 @@ public class WeekView
                             parent?.requestDisallowInterceptTouchEvent(true)
                         }
                         if (direction == Direction.HORIZONTAL) {
-                            scrollDays += distanceX / dayWidth
+                            scrollDays += (if (isRtl) -distanceX else distanceX) / dayWidth
                             notifyDateChanged()
                         } else {
                             topMinute += distanceY / pxPerMinute
@@ -477,7 +580,7 @@ public class WeekView
                         if (isScaling) return true
                         didFling = true
                         if (direction == Direction.HORIZONTAL) {
-                            flingToDay(velocityX)
+                            flingToDay(if (isRtl) -velocityX else velocityX)
                         } else if (direction == Direction.VERTICAL) {
                             val maxY = (maxTopMinute() * pxPerMinute).toInt()
                             yScroller.fling(0, (topMinute * pxPerMinute).toInt(), 0, -velocityY.toInt(), 0, 0, 0, maxY)
@@ -548,8 +651,9 @@ public class WeekView
                 onEvent?.invoke(hit.event)
                 return onEvent != null
             }
-            if (x < timeColumnWidth || y < bodyTop || onEmpty == null) return false
-            val date = dateAt(floor(scrollDays + (x - timeColumnWidth) / dayWidth).toInt())
+            if (x < gridLeft || x >= gridRight || y < bodyTop || onEmpty == null) return false
+            val daysFromStart = (if (isRtl) gridRight - x else x - gridLeft) / dayWidth
+            val date = dateAt(floor(scrollDays + daysFromStart).toInt())
             val minute = (topMinute + (y - bodyTop) / pxPerMinute).toInt().coerceIn(0, WeekViewLayout.MINUTES_PER_DAY - 1)
             onEmpty(LocalDateTime(date, LocalTime(minute / 60, minute % 60)))
             return true
@@ -620,7 +724,8 @@ public class WeekView
         override fun onSaveInstanceState(): Parcelable =
             Bundle().apply {
                 putParcelable(STATE_SUPER, super.onSaveInstanceState())
-                putString(STATE_DATE, firstVisibleDate.toString())
+                // Mid-animation, save the day being scrolled to.
+                putString(STATE_DATE, dateAt(snapTarget ?: scrollDays.roundToInt()).toString())
                 putFloat(STATE_TOP_MINUTE, topMinute)
                 putFloat(STATE_HOUR_HEIGHT, hourHeight)
             }
@@ -643,12 +748,17 @@ public class WeekView
 
         private companion object {
             const val HOURS_PER_DAY = 24
+            const val MIN_TIME_COLUMN_DP = 52f
+            const val TIME_LABEL_PADDING_DP = 8f
             const val DEFAULT_TOP_MINUTE = 8 * 60f
             const val NOW_REFRESH_MILLIS = 30_000L
             const val SNAP_MILLIS_PER_DAY = 220f
             const val MIN_SNAP_MILLIS = 180
             const val MAX_SNAP_MILLIS = 600
-            const val MAX_CACHED_TEXT_LAYOUTS = 256
+            const val MAX_CACHED_TEXT_LAYOUTS = 512
+
+            /** Absorbs float error so a day that has just snapped into place counts as reached. */
+            const val SNAP_EPSILON = 0.001f
             const val QUARTER_TURN = 90f
             const val DARK_TEXT = 0xFF0F172A.toInt()
             const val STATE_SUPER = "super"

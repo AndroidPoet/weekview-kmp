@@ -22,9 +22,14 @@ class WeekViewTouchTest {
     private val lunch = WeekViewEvent("lunch", "Lunch", LocalDateTime(today, LocalTime(9, 0)), LocalDateTime(today, LocalTime(11, 0)))
 
     /** A laid-out 1080x1920 view showing 08:00 at the top; touches are sent on the main thread. */
-    private fun onWeekView(block: (WeekView) -> Unit) =
-        instrumentation.runOnMainSync {
+    private fun onWeekView(
+        layoutDirection: Int = View.LAYOUT_DIRECTION_LTR,
+        block: (WeekView) -> Unit,
+    ) = instrumentation.runOnMainSync {
             val view = WeekView(instrumentation.targetContext)
+            view.layoutDirection = layoutDirection
+            // Fixed labels keep the time column at its 52dp minimum whatever the device's locale.
+            view.timeLabel = { "$it:00" }
             view.events = listOf(lunch)
             view.measure(View.MeasureSpec.makeMeasureSpec(WIDTH, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(HEIGHT, View.MeasureSpec.EXACTLY))
             view.layout(0, 0, WIDTH, HEIGHT)
@@ -161,6 +166,54 @@ class WeekViewTouchTest {
 
             assertEquals(listOf("lunch"), clicked)
             assertEquals(today.plus(2, DateTimeUnit.DAY), slots.single().date)
+        }
+
+    @Test
+    fun test_tap_inRtlLayout_countsDaysFromTheRightEdgeOfTheGrid() =
+        onWeekView(View.LAYOUT_DIRECTION_RTL) { view ->
+            val slots = ArrayList<LocalDateTime>()
+            view.onEmptyClick = { slots += it }
+            view.drawOnce()
+            val timeColumn = 52 * view.resources.displayMetrics.density
+
+            view.tap(WIDTH - timeColumn - 20f to HEIGHT - 20f)
+            view.tap(20f to HEIGHT - 20f)
+            view.tap(WIDTH - 20f to HEIGHT - 20f)
+
+            assertEquals(listOf(today, today.plus(2, DateTimeUnit.DAY)), slots.map { it.date })
+        }
+
+    @Test
+    fun test_drag_inRtlLayout_oneDayToTheRight_showsTheNextDate() =
+        onWeekView(View.LAYOUT_DIRECTION_RTL) { view ->
+            val dayWidth = (WIDTH - 52 * view.resources.displayMetrics.density) / view.visibleDays
+
+            view.drag(200f to 1000f, 200f + dayWidth to 1000f)
+
+            assertEquals(today.plus(1, DateTimeUnit.DAY), view.firstVisibleDate)
+        }
+
+    @Test
+    fun test_allDayEvents_moreThanMaxRows_keepTheHourGridTappable() =
+        onWeekView { view ->
+            val slots = ArrayList<LocalDateTime>()
+            view.onEmptyClick = { slots += it }
+            view.events = List(40) { WeekViewEvent("all-day-$it", "Holiday", LocalDateTime(today, LocalTime(0, 0)), LocalDateTime(today, LocalTime(0, 0)), isAllDay = true) }
+            view.drawOnce()
+
+            view.tap(WIDTH - 20f to HEIGHT / 2f)
+
+            assertEquals(today.plus(2, DateTimeUnit.DAY), slots.single().date)
+        }
+
+    @Test
+    fun test_resize_duringSnapAnimation_landsOnTheDayItWasHeadingFor() =
+        onWeekView { view ->
+            view.goToDate(today.plus(5, DateTimeUnit.DAY), animate = true)
+
+            view.layout(0, 0, WIDTH / 2, HEIGHT)
+
+            assertEquals(today.plus(5, DateTimeUnit.DAY), view.firstVisibleDate)
         }
 
     private companion object {
